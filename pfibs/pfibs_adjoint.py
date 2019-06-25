@@ -15,6 +15,7 @@ class BlockProblem(pf.BlockProblem):
         self._ad_bcs = kwargs.get("bcs",[])
         self._ad_args = args
         self._ad_kwargs = kwargs
+        self.aP = kwargs.get("aP",None)
 
         self.block_helper = BlockSolveBlockHelper()
 
@@ -25,6 +26,7 @@ class LinearBlockSolver(pf.LinearBlockSolver):
         self._ad_problem = problem
         self._ad_args = args
         self._ad_kwargs = kwargs
+        self.ctx = kwargs.get("ctx",None)
 
     def solve(self, **kwargs):
         annotate = annotate_tape()
@@ -40,7 +42,9 @@ class LinearBlockSolver(pf.LinearBlockSolver):
                                              problem._ad_bcs,
                                              block_helper=block_helper,
                                              block_field = self._ad_problem.block_field,
-                                             block_split = self._ad_problem.block_split)
+                                             block_split = self._ad_problem.block_split,
+                                             aP = problem.aP,
+                                             ctx=self.ctx)
             tape.add_block(block)
 
         with stop_annotating():
@@ -58,6 +62,7 @@ class NonlinearBlockSolver(pf.NonlinearBlockSolver):
         self._ad_problem = problem
         self._ad_args = args
         self._ad_kwargs = kwargs
+        self.ctx = kwargs.get("ctx",None)
 
     def solve(self, **kwargs):
         annotate = annotate_tape()
@@ -74,7 +79,8 @@ class NonlinearBlockSolver(pf.NonlinearBlockSolver):
                                              block_helper=block_helper,
                                              problem_J = problem._ad_A,
                                              block_field = self._ad_problem.block_field,
-                                             block_split = self._ad_problem.block_split)
+                                             block_split = self._ad_problem.block_split,
+                                             aP = problem.aP,ctx=self.ctx)
             tape.add_block(block)
 
         with stop_annotating():
@@ -100,16 +106,18 @@ class LinearBlockSolveBlock(SolveBlock):
         self.block_field = kwargs.pop("block_field")
         self.block_split = kwargs.pop("block_split")
         self.block_helper = kwargs.pop("block_helper")
+        self.aP = kwargs.pop("aP")
+        self.ctx = kwargs.pop("ctx")
 
     def _forward_solve(self, lhs, rhs, func, bcs, **kwargs):
         solver = self.block_helper.forward_solver
         if solver is None:
-            problem = pf.BlockProblem(lhs, rhs, func, bcs=bcs)
+            problem = pf.BlockProblem(lhs, rhs, func, bcs=bcs, aP=self.aP)
             for key, value in self.block_field.items():
                 problem.field(key, value[1], solver=value[2])
             for key, value in self.block_split.items():
                 problem.split(key, value[0], solver=value[1])
-            solver = pf.LinearBlockSolver(problem)
+            solver = pf.LinearBlockSolver(problem,ctx=self.ctx)
             self.block_helper.forward_solver = solver
         solver.solve()
         return func
@@ -119,16 +127,16 @@ class LinearBlockSolveBlock(SolveBlock):
         bcs = self._homogenize_bcs()
 
         solver = self.block_helper.adjoint_solver
+        adj_sol = df.Function(self.function_space)
         if solver is None:
 
-            adj_sol = df.Function(self.function_space)
 
-            adjoint_problem = pf.BlockProblem(dFdu_form, dJdu, adj_sol, bcs=bcs)
+            adjoint_problem = pf.BlockProblem(dFdu_form, dJdu, adj_sol, bcs=bcs, aP=self.aP)
             for key, value in self.block_field.items():
                 adjoint_problem.field(key, value[1], solver=value[2])
             for key, value in self.block_split.items():
                 adjoint_problem.split(key, value[0], solver=value[1])
-            solver = pf.LinearBlockSolver(adjoint_problem)
+            solver = pf.LinearBlockSolver(adjoint_problem,ctx=self.ctx)
             self.block_helper.adjoint_solver = solver
 
 ############
@@ -137,8 +145,25 @@ class LinearBlockSolveBlock(SolveBlock):
             A_, _ = df.assemble_system(dFdu_form, rhs_bcs_form, bcs)
             A = df.as_backend_type(A_)
 
-            solver.linear_solver.set_operators(A,A)
+
+            if self.aP is not None:
+                P = self._replace_form(self.aP)
+                P = self.aP
+                P_, _ = df.assemble_system(P, rhs_bcs_form, bcs)
+                P = df.as_backend_type(P_)
+                solver.linear_solver.set_operators(A, P)
+            else:
+                solver.linear_solver.set_operator(A)
             solver.linear_solver.init_solver_options()
+
+#            ## Assemble preconditioner if provided ##
+#            if self.aP is not None:
+#                df.assemble(self.aP,tensor=self.P)
+#                if isinstance(self.bcs,list):
+#                    for bc in self.bcs:
+#                        bc.apply(self.P)
+#                else:
+#                    self.bcs.apply(self.P)
 
         [bc.apply(dJdu) for bc in bcs]
         b = df.as_backend_type(dJdu)
@@ -156,6 +181,8 @@ class NonlinearBlockSolveBlock(SolveBlock):
         self.block_field = kwargs.pop("block_field")
         self.block_split = kwargs.pop("block_split")
         self.block_helper = kwargs.pop("block_helper")
+        self.aP = kwargs.pop("aP")
+        self.ctx = kwargs.pop("ctx")
 
 
         for coeff in self.nonlin_problem_J.coefficients():
@@ -167,12 +194,12 @@ class NonlinearBlockSolveBlock(SolveBlock):
             J = self.nonlin_problem_J
             if J is not None:
                 J = self._replace_form(J, func)
-            problem = pf.BlockProblem(J, lhs, func, bcs=bcs)
+            problem = pf.BlockProblem(J, lhs, func, bcs=bcs, aP=self.aP)
             for key, value in self.block_field.items():
                 problem.field(key, value[1], solver=value[2])
             for key, value in self.block_split.items():
                 problem.split(key, value[0], solver=value[1])
-            solver = pf.NonlinearBlockSolver(problem)
+            solver = pf.NonlinearBlockSolver(problem,ctx=self.ctx)
             self.block_helper.forward_solver = solver
         solver.solve()
         return func
@@ -182,16 +209,16 @@ class NonlinearBlockSolveBlock(SolveBlock):
         bcs = self._homogenize_bcs()
 
         solver = self.block_helper.adjoint_solver
+        adj_sol = df.Function(self.function_space)
         if solver is None:
 
-            adj_sol = df.Function(self.function_space)
 
             adjoint_problem = pf.BlockProblem(dFdu_form, dJdu, adj_sol, bcs=bcs)
             for key, value in self.block_field.items():
                 adjoint_problem.field(key, value[1], solver=value[2])
             for key, value in self.block_split.items():
                 adjoint_problem.split(key, value[0], solver=value[1])
-            solver = pf.LinearBlockSolver(adjoint_problem)
+            solver = pf.LinearBlockSolver(adjoint_problem,ctx=self.ctx)
             self.block_helper.adjoint_solver = solver
 
 ############
@@ -200,7 +227,14 @@ class NonlinearBlockSolveBlock(SolveBlock):
             A_, _ = df.assemble_system(dFdu_form, rhs_bcs_form, bcs)
             A = df.as_backend_type(A_)
 
-            solver.linear_solver.set_operators(A,A)
+            if self.aP is not None:
+                P = self._replace_form(self.aP)
+                P = self.aP
+                P_, _ = df.assemble_system(P, rhs_bcs_form, bcs)
+                P = df.as_backend_type(P_)
+                solver.linear_solver.set_operators(A, P)
+            else:
+                solver.linear_solver.set_operator(A)
             solver.linear_solver.init_solver_options()
 
         [bc.apply(dJdu) for bc in bcs]
